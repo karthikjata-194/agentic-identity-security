@@ -1,0 +1,200 @@
+| =====================================================================
+| Detection Rule: AI Workload Identity Anomalies
+| Author: Karthik Reddy
+| Version: 1.0
+| Last Updated: June 2026
+| MITRE ATT&CK: T1078 (Valid Accounts), T1539 (Steal Web Session Cookie)
+| Threat Model Reference: S-1 (Agent Identity Spoofing),
+|                         S-2 (Prompt Injection Identity Abuse)
+| =====================================================================
+
+| ---------------------------------------------------------------------
+| RULE 1: Anomalous API Call Volume from AI Workload Identity
+| Detects: AI service accounts making unusually high API call volumes
+| which may indicate a runaway agent, prompt injection loop,
+| or compromised agent credential being actively abused
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    userAgent="*boto*" OR userAgent="*langchain*" OR userAgent="*openai*"
+    OR userAgent="*anthropic*" OR userAgent="*llm*"
+| bucket _time span=5m
+| stats count as api_calls
+    dc(eventName) as unique_actions
+    dc(requestParameters.bucketName) as unique_buckets
+    values(eventName) as actions
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn _time
+| eventstats avg(api_calls) as avg_calls
+    stdev(api_calls) as stdev_calls
+    by userIdentity.arn
+| eval threshold = avg_calls + (3 * stdev_calls)
+| eval is_anomalous = if(api_calls > threshold AND api_calls > 100, 1, 0)
+| where is_anomalous = 1
+| eval severity = case(
+    api_calls > threshold * 3, "CRITICAL",
+    api_calls > threshold * 2, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI workload identity " + userIdentity.arn +
+    " made " + api_calls + " API calls in 5 minutes. " +
+    "Baseline average: " + round(avg_calls, 0) + " calls."
+| table _time userIdentity.arn api_calls avg_calls
+    unique_actions actions source_ips severity description
+| sort - api_calls
+
+
+| ---------------------------------------------------------------------
+| RULE 2: AI Agent Accessing Secrets Outside Expected Pattern
+| Detects: Agent identities retrieving secrets at unusual times,
+| from unusual locations, or at unusual frequency — may indicate
+| credential harvesting or compromised agent behavior
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource="secretsmanager.amazonaws.com"
+    eventName IN ("GetSecretValue", "DescribeSecret", "ListSecrets")
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| bucket _time span=1h
+| stats count as secret_retrievals
+    dc(requestParameters.secretId) as unique_secrets
+    values(requestParameters.secretId) as secret_names
+    values(sourceIPAddress) as source_ips
+    values(userAgent) as user_agents
+    by userIdentity.arn _time
+| eventstats avg(secret_retrievals) as avg_retrievals
+    by userIdentity.arn
+| eval anomaly_score = round(secret_retrievals / max(avg_retrievals, 1), 2)
+| eval is_anomalous = if(
+    secret_retrievals > 20 OR
+    unique_secrets > 5 OR
+    anomaly_score > 3,
+    1, 0
+  )
+| where is_anomalous = 1
+| eval severity = case(
+    unique_secrets > 10, "CRITICAL",
+    unique_secrets > 5 OR anomaly_score > 5, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI identity " + userIdentity.arn +
+    " retrieved " + secret_retrievals + " secrets (" +
+    unique_secrets + " unique) in 1 hour. " +
+    "Anomaly score: " + anomaly_score
+| table _time userIdentity.arn secret_retrievals unique_secrets
+    secret_names source_ips anomaly_score severity description
+| sort - anomaly_score
+
+
+| ---------------------------------------------------------------------
+| RULE 3: AI Workload Identity Used from Unexpected Location
+| Detects: Agent credentials being used from IP ranges outside
+| expected cloud provider ranges — may indicate stolen credentials
+| being used from attacker infrastructure
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| eval is_aws_ip = if(
+    match(sourceIPAddress, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"),
+    1, 0
+  )
+| eval is_known_service = if(
+    sourceIPAddress IN ("AWS Internal") OR
+    match(sourceIPAddress, "^(3\.|52\.|54\.|18\.)"),
+    1, 0
+  )
+| eval is_unexpected_origin = if(
+    is_aws_ip = 0 AND is_known_service = 0,
+    1, 0
+  )
+| where is_unexpected_origin = 1
+| stats count as api_calls
+    values(eventName) as actions
+    values(sourceIPAddress) as source_ips
+    values(userAgent) as user_agents
+    by userIdentity.arn
+| where api_calls > 0
+| eval severity = "HIGH"
+| eval description = "AI workload identity " + userIdentity.arn +
+    " used from unexpected IP: " + source_ips +
+    ". This identity should only operate within AWS infrastructure."
+| table userIdentity.arn api_calls actions
+    source_ips user_agents severity description
+| sort - api_calls
+
+
+| ---------------------------------------------------------------------
+| RULE 4: New AI Agent Identity — First Seen Alert
+| Detects: A new AI workload identity making API calls for the
+| first time — useful for identifying unauthorized agent deployments
+| or shadow AI infrastructure spun up without security review
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain|openai|anthropic)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| stats min(_time) as first_seen
+    max(_time) as last_seen
+    count as total_calls
+    values(eventName) as actions
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn
+| eval first_seen_human = strftime(first_seen, "%Y-%m-%d %H:%M:%S")
+| eval age_hours = round((now() - first_seen) / 3600, 1)
+| where age_hours < 24
+| eval severity = "MEDIUM"
+| eval description = "New AI workload identity detected: " +
+    userIdentity.arn + ". First seen " + age_hours +
+    " hours ago. Review if this agent deployment was authorized."
+| table userIdentity.arn first_seen_human age_hours
+    total_calls actions source_ips severity description
+| sort first_seen
+
+
+| ---------------------------------------------------------------------
+| RULE 5: AI Agent Cross-Account Activity
+| Detects: Agent identities assuming roles across AWS accounts —
+| legitimate in multi-account architectures but high risk if
+| unexpected, potentially indicating privilege escalation attempts
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventName="AssumeRole"
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference)") OR
+    match(requestParameters.roleArn, "(?i)(ai|llm|agent|ml|model)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| eval source_account = replace(userIdentity.arn, "arn:aws:iam::(\d+):.*", "\1")
+| eval target_account = replace(requestParameters.roleArn, "arn:aws:iam::(\d+):.*", "\1")
+| eval is_cross_account = if(source_account != target_account, 1, 0)
+| where is_cross_account = 1
+| stats count as assume_role_count
+    values(requestParameters.roleArn) as target_roles
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn source_account target_account
+| eval severity = case(
+    assume_role_count > 10, "CRITICAL",
+    assume_role_count > 5, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI identity " + userIdentity.arn +
+    " assumed cross-account roles " + assume_role_count +
+    " times from account " + source_account +
+    " to account " + target_account
+| table userIdentity.arn source_account target_account
+    assume_role_count target_roles source_ips severity description
+| sort - assume_role_count
