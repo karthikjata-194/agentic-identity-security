@@ -1,0 +1,279 @@
+{
+  "Comment": "=====================================================================",
+  "CommentDetail": [
+    "IAM Policy: AI Workload Least Privilege",
+    "Author: Karthik Reddy",
+    "Version: 1.0",
+    "Last Updated: June 2026",
+    "Purpose: Least-privilege IAM policy for LLM/AI agent workloads",
+    "Threat Model Reference: S-1, E-1, E-2, I-1, I-2",
+    "====================================================================="
+  ],
+  "Policies": {
+    "AIAgentBasePolicy": {
+      "Description": "Base policy for all AI agent workloads. Grants minimum permissions needed for an LLM agent to operate. Attach to all AI workload IAM roles as baseline.",
+      "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowSecretRetrievalScopedToAIPrefix",
+            "Effect": "Allow",
+            "Action": [
+              "secretsmanager:GetSecretValue",
+              "secretsmanager:DescribeSecret"
+            ],
+            "Resource": [
+              "arn:aws:secretsmanager:*:*:secret:ai/agents/*",
+              "arn:aws:secretsmanager:*:*:secret:ai/llm/*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": [
+                  "us-east-1",
+                  "us-west-2"
+                ]
+              },
+              "Bool": {
+                "aws:SecureTransport": "true"
+              }
+            }
+          },
+          {
+            "Sid": "AllowKMSDecryptForAIWorkloads",
+            "Effect": "Allow",
+            "Action": [
+              "kms:Decrypt",
+              "kms:GenerateDataKey"
+            ],
+            "Resource": "*",
+            "Condition": {
+              "StringLike": {
+                "kms:ViaService": "secretsmanager.*.amazonaws.com"
+              },
+              "StringEquals": {
+                "kms:CallerAccount": "${aws:AccountId}"
+              }
+            }
+          },
+          {
+            "Sid": "AllowCloudWatchLogging",
+            "Effect": "Allow",
+            "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents",
+              "logs:DescribeLogStreams"
+            ],
+            "Resource": [
+              "arn:aws:logs:*:*:log-group:/ai/agents/*",
+              "arn:aws:logs:*:*:log-group:/ai/llm/*"
+            ]
+          },
+          {
+            "Sid": "DenyIAMModifications",
+            "Effect": "Deny",
+            "Action": [
+              "iam:CreateUser",
+              "iam:CreateRole",
+              "iam:DeleteRole",
+              "iam:AttachRolePolicy",
+              "iam:DetachRolePolicy",
+              "iam:PutRolePolicy",
+              "iam:DeleteRolePolicy",
+              "iam:CreatePolicy",
+              "iam:CreatePolicyVersion",
+              "iam:SetDefaultPolicyVersion",
+              "iam:CreateAccessKey",
+              "iam:UpdateAccessKey",
+              "iam:DeleteAccessKey",
+              "iam:CreateLoginProfile",
+              "iam:UpdateAssumeRolePolicy",
+              "iam:PassRole"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "DenyCloudTrailModification",
+            "Effect": "Deny",
+            "Action": [
+              "cloudtrail:StopLogging",
+              "cloudtrail:DeleteTrail",
+              "cloudtrail:UpdateTrail",
+              "cloudtrail:PutEventSelectors"
+            ],
+            "Resource": "*"
+          },
+          {
+            "Sid": "DenyOrganizationActions",
+            "Effect": "Deny",
+            "Action": [
+              "organizations:*",
+              "account:*"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }
+    },
+    "AIAgentS3ReadPolicy": {
+      "Description": "Scoped S3 read policy for AI agents that need to read specific data buckets. Replace BUCKET_NAME and PREFIX with actual values per agent use case.",
+      "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowScopedS3Read",
+            "Effect": "Allow",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::BUCKET_NAME",
+              "arn:aws:s3:::BUCKET_NAME/PREFIX/*"
+            ],
+            "Condition": {
+              "Bool": {
+                "aws:SecureTransport": "true"
+              },
+              "StringEquals": {
+                "s3:ExistingObjectTag/DataClassification": [
+                  "PUBLIC",
+                  "INTERNAL"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyHighClassificationData",
+            "Effect": "Deny",
+            "Action": "s3:GetObject",
+            "Resource": "*",
+            "Condition": {
+              "StringEquals": {
+                "s3:ExistingObjectTag/DataClassification": [
+                  "CONFIDENTIAL",
+                  "RESTRICTED",
+                  "PII",
+                  "PHI"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyS3Write",
+            "Effect": "Deny",
+            "Action": [
+              "s3:PutObject",
+              "s3:DeleteObject",
+              "s3:PutBucketPolicy",
+              "s3:DeleteBucket",
+              "s3:PutBucketAcl"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }
+    },
+    "AIAgentInferencePolicy": {
+      "Description": "Policy for AI agents that invoke Bedrock or SageMaker inference endpoints. Scoped to specific model ARNs and endpoints only.",
+      "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowBedrockInference",
+            "Effect": "Allow",
+            "Action": [
+              "bedrock:InvokeModel",
+              "bedrock:InvokeModelWithResponseStream"
+            ],
+            "Resource": [
+              "arn:aws:bedrock:*::foundation-model/anthropic.claude*",
+              "arn:aws:bedrock:*::foundation-model/amazon.titan*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": [
+                  "us-east-1",
+                  "us-west-2"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "AllowSageMakerInferenceScopedToEndpoint",
+            "Effect": "Allow",
+            "Action": [
+              "sagemaker:InvokeEndpoint"
+            ],
+            "Resource": [
+              "arn:aws:sagemaker:*:*:endpoint/ai-*",
+              "arn:aws:sagemaker:*:*:endpoint/llm-*"
+            ]
+          },
+          {
+            "Sid": "DenyBedrockAdminActions",
+            "Effect": "Deny",
+            "Action": [
+              "bedrock:CreateModelCustomizationJob",
+              "bedrock:DeleteFoundationModel",
+              "bedrock:PutModelInvocationLoggingConfiguration",
+              "bedrock:DeleteModelInvocationLoggingConfiguration"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }
+    },
+    "AIAgentTrustPolicy": {
+      "Description": "Trust policy for AI agent IAM roles. Restricts which services and accounts can assume the role. Apply to all AI workload roles.",
+      "TrustPolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowECSTaskAssumption",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ecs-tasks.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+              "StringEquals": {
+                "aws:SourceAccount": "${aws:AccountId}"
+              },
+              "ArnLike": {
+                "aws:SourceArn": "arn:aws:ecs:*:*:task-definition/ai-*"
+              }
+            }
+          },
+          {
+            "Sid": "AllowLambdaAssumption",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole",
+            "Condition": {
+              "StringEquals": {
+                "aws:SourceAccount": "${aws:AccountId}"
+              },
+              "ArnLike": {
+                "aws:SourceArn": "arn:aws:lambda:*:*:function:ai-*"
+              }
+            }
+          },
+          {
+            "Sid": "DenyExternalAccountAssumption",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "sts:AssumeRole",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalAccount": "${aws:AccountId}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
