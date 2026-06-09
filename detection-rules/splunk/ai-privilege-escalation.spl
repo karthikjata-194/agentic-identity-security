@@ -1,0 +1,262 @@
+| =====================================================================
+| Detection Rule: AI Workload Privilege Escalation
+| Author: Karthik Reddy
+| Version: 1.0
+| Last Updated: June 2026
+| MITRE ATT&CK: T1548 (Abuse Elevation Control Mechanism),
+|               T1134 (Access Token Manipulation),
+|               T1098 (Account Manipulation),
+|               T1484 (Domain Policy Modification)
+| Threat Model Reference: E-1 (Cross-Agent Privilege Escalation),
+|                         E-2 (Tool Use Abuse for Privilege Escalation)
+| =====================================================================
+
+
+| ---------------------------------------------------------------------
+| RULE 1: AI Agent Attempting IAM Policy Modification
+| Detects: AI workload identities attempting to create, modify, or
+| attach IAM policies — a critical indicator of privilege escalation
+| as legitimate agents should never need to modify their own
+| or others permissions
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource="iam.amazonaws.com"
+    eventName IN (
+        "CreatePolicy", "CreatePolicyVersion",
+        "PutUserPolicy", "PutRolePolicy", "PutGroupPolicy",
+        "AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy",
+        "CreateRole", "UpdateAssumeRolePolicy",
+        "AddUserToGroup", "CreateUser"
+    )
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| stats count as iam_modification_count
+    values(eventName) as actions_attempted
+    values(requestParameters.policyName) as policy_names
+    values(requestParameters.roleName) as role_names
+    values(sourceIPAddress) as source_ips
+    values(userAgent) as user_agents
+    by userIdentity.arn
+| eval severity = case(
+    iam_modification_count > 5, "CRITICAL",
+    match(mvjoin(actions_attempted, ","),
+        "CreatePolicy|AttachRolePolicy|UpdateAssumeRolePolicy"), "CRITICAL",
+    true(), "HIGH"
+  )
+| eval description = "CRITICAL: AI identity " + userIdentity.arn +
+    " attempted IAM modifications " + iam_modification_count +
+    " times. Actions: " + mvjoin(actions_attempted, ", ") +
+    ". AI workloads should never modify IAM policies."
+| table userIdentity.arn iam_modification_count
+    actions_attempted policy_names role_names
+    source_ips severity description
+| sort - iam_modification_count
+
+
+| ---------------------------------------------------------------------
+| RULE 2: Cross-Agent Privilege Escalation via Role Chaining
+| Detects: A chain of AssumeRole calls originating from an AI
+| identity that progressively gains higher privilege levels —
+| indicates cross-agent privilege escalation attempts
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventName="AssumeRole"
+| eval is_ai_related = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference)") OR
+    match(requestParameters.roleArn, "(?i)(ai|llm|agent|ml|model|admin|prod|privileged)"),
+    1, 0
+  )
+| where is_ai_related = 1
+| eval assumed_role = requestParameters.roleArn
+| eval session_name = requestParameters.roleSessionName
+| sort _time
+| streamstats count as hop_count
+    values(userIdentity.arn) as identity_chain
+    values(assumed_role) as role_chain
+    by session_name
+| eval is_role_chaining = if(hop_count > 2, 1, 0)
+| where is_role_chaining = 1
+| eval is_escalation = if(
+    match(mvjoin(role_chain, ","),
+        "(?i)(admin|root|privileged|prod|master|superuser)"),
+    1, 0
+  )
+| stats max(hop_count) as max_hops
+    values(identity_chain) as full_identity_chain
+    values(role_chain) as full_role_chain
+    count as total_events
+    by session_name
+| eval severity = case(
+    is_escalation = 1 AND max_hops > 3, "CRITICAL",
+    is_escalation = 1, "HIGH",
+    max_hops > 4, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "Role chaining detected from AI workload. " +
+    "Chain depth: " + max_hops + " hops. " +
+    "Identity chain: " + mvjoin(full_identity_chain, " -> ") +
+    ". Role chain: " + mvjoin(full_role_chain, " -> ")
+| table session_name max_hops full_identity_chain
+    full_role_chain total_events severity description
+| sort - max_hops
+
+
+| ---------------------------------------------------------------------
+| RULE 3: AI Agent Using Infrastructure Automation Tools
+| Detects: AI workload identities invoking Terraform, CloudFormation,
+| or other IaC tools — may indicate an agent being manipulated
+| via prompt injection to modify infrastructure or create
+| backdoor resources
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource IN (
+        "cloudformation.amazonaws.com",
+        "elasticmapreduce.amazonaws.com"
+    )
+    OR (
+        eventSource="iam.amazonaws.com" AND
+        eventName IN ("CreateRole", "CreateUser", "CreateAccessKey")
+    )
+    OR (
+        userAgent="*terraform*" OR
+        userAgent="*cloudformation*" OR
+        userAgent="*pulumi*"
+    )
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| stats count as infra_actions
+    values(eventName) as actions
+    values(eventSource) as services
+    values(userAgent) as tools_used
+    values(requestParameters.stackName) as stack_names
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn
+| eval severity = case(
+    match(mvjoin(actions, ","),
+        "CreateUser|CreateAccessKey|CreateRole"), "CRITICAL",
+    infra_actions > 10, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI identity " + userIdentity.arn +
+    " invoked infrastructure automation tools " +
+    infra_actions + " times. Tools: " +
+    mvjoin(tools_used, ", ") +
+    ". Actions: " + mvjoin(actions, ", ") +
+    ". Verify this was authorized and not prompt-injection driven."
+| table userIdentity.arn infra_actions actions
+    services tools_used stack_names
+    source_ips severity description
+| sort - infra_actions
+
+
+| ---------------------------------------------------------------------
+| RULE 4: AI Agent Creating New Identities or Access Keys
+| Detects: AI workloads creating new IAM users, roles, or access
+| keys — a classic persistence and privilege escalation technique
+| where a compromised agent creates a backdoor identity for
+| continued attacker access
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource="iam.amazonaws.com"
+    eventName IN (
+        "CreateUser", "CreateRole",
+        "CreateAccessKey", "CreateLoginProfile",
+        "CreateVirtualMFADevice"
+    )
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| eval created_entity = coalesce(
+    requestParameters.userName,
+    requestParameters.roleName,
+    responseElements.accessKey.accessKeyId,
+    "unknown"
+  )
+| stats count as creation_count
+    values(eventName) as creation_actions
+    values(created_entity) as entities_created
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn
+| eval severity = "CRITICAL"
+| eval description = "CRITICAL ALERT: AI identity " +
+    userIdentity.arn +
+    " created new IAM entities: " +
+    mvjoin(entities_created, ", ") +
+    ". Actions: " + mvjoin(creation_actions, ", ") +
+    ". This is a strong indicator of backdoor creation or " +
+    "persistence mechanism establishment."
+| table userIdentity.arn creation_count
+    creation_actions entities_created
+    source_ips severity description
+| sort - creation_count
+
+
+| ---------------------------------------------------------------------
+| RULE 5: Anomalous Permission Enumeration by AI Workload
+| Detects: AI identities performing broad permission enumeration
+| by calling GetCallerIdentity, ListRoles, ListPolicies, and
+| similar discovery APIs — indicates reconnaissance phase of
+| a privilege escalation attack
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventName IN (
+        "GetCallerIdentity",
+        "ListRoles", "ListUsers", "ListGroups",
+        "ListPolicies", "ListAttachedRolePolicies",
+        "ListRolePolicies", "GetAccountAuthorizationDetails",
+        "SimulatePrincipalPolicy", "SimulateCustomPolicy",
+        "GetAccountSummary", "ListAccountAliases"
+    )
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| bucket _time span=10m
+| stats count as enumeration_calls
+    dc(eventName) as unique_enum_actions
+    values(eventName) as actions
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn _time
+| eventstats avg(enumeration_calls) as avg_enum
+    by userIdentity.arn
+| eval anomaly_score = round(
+    enumeration_calls / max(avg_enum, 1), 2
+  )
+| eval is_anomalous = if(
+    enumeration_calls > 20 OR
+    unique_enum_actions > 5 OR
+    anomaly_score > 3,
+    1, 0
+  )
+| where is_anomalous = 1
+| eval severity = case(
+    unique_enum_actions > 8 OR
+    match(mvjoin(actions, ","),
+        "GetAccountAuthorizationDetails|SimulatePrincipalPolicy"), "CRITICAL",
+    unique_enum_actions > 5 OR anomaly_score > 5, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI identity " + userIdentity.arn +
+    " performed " + enumeration_calls +
+    " IAM enumeration calls (" +
+    unique_enum_actions + " unique actions) in 10 minutes. " +
+    "Anomaly score: " + anomaly_score +
+    ". Actions: " + mvjoin(actions, ", ")
+| table _time userIdentity.arn enumeration_calls
+    unique_enum_actions actions anomaly_score
+    source_ips severity description
+| sort - anomaly_score
