@@ -1,0 +1,266 @@
+| =====================================================================
+| Detection Rule: AI Workload Data Exfiltration
+| Author: Karthik Reddy
+| Version: 1.0
+| Last Updated: June 2026
+| MITRE ATT&CK: T1048 (Exfiltration Over Alternative Protocol),
+|               T1567 (Exfiltration Over Web Service),
+|               T1530 (Data from Cloud Storage Object)
+| Threat Model Reference: I-1 (Sensitive Data Exfiltration via LLM),
+|                         I-2 (Secret Leakage via Logs)
+| =====================================================================
+
+
+| ---------------------------------------------------------------------
+| RULE 1: Large Data Transfers Initiated by AI Workload Identity
+| Detects: AI agent identities reading unusually large volumes of
+| data from S3 or other storage — may indicate data harvesting
+| prior to exfiltration through the LLM interface
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource="s3.amazonaws.com"
+    eventName IN ("GetObject", "ListObjects", "ListObjectsV2", "SelectObjectContent")
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference|langchain)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| bucket _time span=10m
+| stats count as s3_reads
+    dc(requestParameters.bucketName) as unique_buckets
+    dc(requestParameters.key) as unique_objects
+    sum(bytes) as total_bytes
+    values(requestParameters.bucketName) as buckets_accessed
+    values(sourceIPAddress) as source_ips
+    by userIdentity.arn _time
+| eval total_mb = round(total_bytes / 1024 / 1024, 2)
+| eventstats avg(s3_reads) as avg_reads
+    avg(total_bytes) as avg_bytes
+    by userIdentity.arn
+| eval read_anomaly = round(s3_reads / max(avg_reads, 1), 2)
+| eval byte_anomaly = round(total_bytes / max(avg_bytes, 1), 2)
+| eval is_anomalous = if(
+    total_mb > 500 OR
+    unique_buckets > 5 OR
+    read_anomaly > 3 OR
+    byte_anomaly > 3,
+    1, 0
+  )
+| where is_anomalous = 1
+| eval severity = case(
+    total_mb > 2000 OR unique_buckets > 10, "CRITICAL",
+    total_mb > 500 OR unique_buckets > 5, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI identity " + userIdentity.arn +
+    " read " + total_mb + " MB across " +
+    unique_buckets + " buckets (" +
+    unique_objects + " objects) in 10 minutes."
+| table _time userIdentity.arn s3_reads unique_buckets
+    unique_objects total_mb buckets_accessed
+    read_anomaly byte_anomaly severity description
+| sort - total_mb
+
+
+| ---------------------------------------------------------------------
+| RULE 2: Sensitive Pattern Detection in LLM Application Logs
+| Detects: Credential patterns, PII, and sensitive data appearing
+| in LLM prompt or completion logs — indicates secret leakage
+| through the AI interface or poor secret handling in agent code
+| ---------------------------------------------------------------------
+
+index=app_logs sourcetype=llm_application_logs
+| eval contains_aws_key = if(
+    match(_raw, "AKIA[0-9A-Z]{16}") OR
+    match(_raw, "ASIA[0-9A-Z]{16}"),
+    1, 0
+  )
+| eval contains_secret_key = if(
+    match(_raw, "[0-9a-zA-Z/+]{40}"),
+    1, 0
+  )
+| eval contains_api_key = if(
+    match(_raw, "(?i)(api[_-]?key|apikey|api[_-]?secret)\s*[:=]\s*['\"]?[0-9a-zA-Z\-_]{20,}"),
+    1, 0
+  )
+| eval contains_pii = if(
+    match(_raw, "\b\d{3}-\d{2}-\d{4}\b") OR
+    match(_raw, "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b") OR
+    match(_raw, "\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b"),
+    1, 0
+  )
+| eval contains_private_key = if(
+    match(_raw, "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    1, 0
+  )
+| eval sensitive_type = case(
+    contains_private_key = 1, "PRIVATE_KEY",
+    contains_aws_key = 1, "AWS_CREDENTIAL",
+    contains_api_key = 1, "API_KEY",
+    contains_pii = 1, "PII",
+    contains_secret_key = 1, "POTENTIAL_SECRET",
+    true(), "UNKNOWN"
+  )
+| eval is_sensitive = if(
+    contains_aws_key = 1 OR contains_secret_key = 1 OR
+    contains_api_key = 1 OR contains_pii = 1 OR
+    contains_private_key = 1,
+    1, 0
+  )
+| where is_sensitive = 1
+| stats count as occurrences
+    values(sensitive_type) as data_types
+    values(host) as hosts
+    values(source) as log_sources
+    by agent_id session_id
+| eval severity = case(
+    mvcount(data_types) > 2, "CRITICAL",
+    sensitive_type = "PRIVATE_KEY" OR
+    sensitive_type = "AWS_CREDENTIAL", "CRITICAL",
+    sensitive_type = "API_KEY", "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "Sensitive data pattern detected in LLM logs. " +
+    "Agent: " + agent_id + " | Session: " + session_id +
+    " | Data types found: " + mvjoin(data_types, ", ")
+| table agent_id session_id occurrences
+    data_types hosts log_sources severity description
+| sort - occurrences
+
+
+| ---------------------------------------------------------------------
+| RULE 3: AI Agent Calling Unexpected External Endpoints
+| Detects: AI workload identities making calls to external domains
+| outside an approved allowlist — may indicate data exfiltration
+| via webhook, callback, or third-party API abuse
+| ---------------------------------------------------------------------
+
+index=network_logs sourcetype=vpc_flow_logs
+| eval is_ai_workload = if(
+    match(src_ip, "10\.10\.50\.") OR
+    match(instance_tag_name, "(?i)(ai|llm|agent|ml|inference)"),
+    1, 0
+  )
+| where is_ai_workload = 1
+| eval is_approved_destination = if(
+    match(dest_domain, "amazonaws\.com$") OR
+    match(dest_domain, "googleapis\.com$") OR
+    match(dest_domain, "openai\.com$") OR
+    match(dest_domain, "anthropic\.com$") OR
+    match(dest_domain, "internal\.company\.com$"),
+    1, 0
+  )
+| where is_approved_destination = 0
+| bucket _time span=5m
+| stats count as connection_count
+    sum(bytes_out) as total_bytes_out
+    dc(dest_domain) as unique_destinations
+    values(dest_domain) as destinations
+    values(dest_port) as ports
+    by src_ip instance_tag_name _time
+| eval total_mb_out = round(total_bytes_out / 1024 / 1024, 2)
+| eval severity = case(
+    total_mb_out > 100 OR unique_destinations > 10, "CRITICAL",
+    total_mb_out > 10 OR unique_destinations > 5, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "AI workload " + instance_tag_name +
+    " (" + src_ip + ") sent " + total_mb_out +
+    " MB to " + unique_destinations +
+    " unexpected external destinations: " +
+    mvjoin(destinations, ", ")
+| table _time src_ip instance_tag_name connection_count
+    unique_destinations destinations total_mb_out
+    ports severity description
+| sort - total_mb_out
+
+
+| ---------------------------------------------------------------------
+| RULE 4: Repeated Secret Retrieval Followed by External Connection
+| Detects: Correlation between secret store access and outbound
+| external connections from the same AI workload — high confidence
+| indicator of credential theft and exfiltration
+| ---------------------------------------------------------------------
+
+index=cloud_trail sourcetype=aws:cloudtrail
+    eventSource="secretsmanager.amazonaws.com"
+    eventName="GetSecretValue"
+| eval is_ai_identity = if(
+    match(userIdentity.arn, "(?i)(ai|llm|agent|ml|model|inference)"),
+    1, 0
+  )
+| where is_ai_identity = 1
+| eval secret_time = _time
+| table secret_time userIdentity.arn
+    requestParameters.secretId sourceIPAddress
+| join sourceIPAddress [
+    search index=network_logs sourcetype=vpc_flow_logs
+        bytes_out > 1000000
+    | eval network_time = _time
+    | eval is_external = if(
+        NOT match(dest_ip, "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"),
+        1, 0
+      )
+    | where is_external = 1
+    | table network_time src_ip dest_ip dest_domain bytes_out
+    | rename src_ip as sourceIPAddress
+  ]
+| eval time_delta_mins = round(abs(network_time - secret_time) / 60, 1)
+| where time_delta_mins < 15
+| eval total_mb = round(bytes_out / 1024 / 1024, 2)
+| eval severity = "CRITICAL"
+| eval description = "HIGH CONFIDENCE EXFILTRATION INDICATOR: " +
+    "AI identity " + userIdentity.arn +
+    " retrieved secret '" + requestParameters.secretId +
+    "' then made " + total_mb + " MB outbound connection to " +
+    dest_domain + " within " + time_delta_mins + " minutes."
+| table secret_time userIdentity.arn
+    requestParameters.secretId dest_domain
+    total_mb time_delta_mins severity description
+| sort - total_mb
+
+
+| ---------------------------------------------------------------------
+| RULE 5: LLM Token Consumption Spike — Potential Data Harvesting
+| Detects: Sudden spikes in LLM token consumption that may indicate
+| an agent is processing and summarizing large volumes of sensitive
+| data — a precursor to exfiltration through the LLM interface
+| ---------------------------------------------------------------------
+
+index=app_logs sourcetype=llm_usage_logs
+| bucket _time span=15m
+| stats sum(prompt_tokens) as total_prompt_tokens
+    sum(completion_tokens) as total_completion_tokens
+    sum(total_tokens) as total_tokens
+    count as request_count
+    dc(session_id) as unique_sessions
+    values(model) as models_used
+    by agent_id _time
+| eventstats avg(total_tokens) as avg_tokens
+    stdev(total_tokens) as stdev_tokens
+    avg(total_prompt_tokens) as avg_prompt_tokens
+    by agent_id
+| eval token_threshold = avg_tokens + (3 * stdev_tokens)
+| eval prompt_ratio = round(total_prompt_tokens /
+    max(total_completion_tokens, 1), 2)
+| eval is_anomalous = if(
+    total_tokens > token_threshold AND
+    total_tokens > 100000,
+    1, 0
+  )
+| where is_anomalous = 1
+| eval severity = case(
+    total_tokens > token_threshold * 3, "CRITICAL",
+    total_tokens > token_threshold * 2, "HIGH",
+    true(), "MEDIUM"
+  )
+| eval description = "Agent " + agent_id +
+    " consumed " + total_tokens + " tokens in 15 minutes. " +
+    "Baseline average: " + round(avg_tokens, 0) +
+    " tokens. Prompt ratio: " + prompt_ratio +
+    " (high ratio may indicate bulk data ingestion)."
+| table _time agent_id total_tokens avg_tokens
+    total_prompt_tokens prompt_ratio unique_sessions
+    models_used severity description
+| sort - total_tokens
